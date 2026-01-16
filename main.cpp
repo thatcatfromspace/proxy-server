@@ -1,6 +1,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -10,13 +11,15 @@
 #include <iostream>
 
 #include "include/conn.h"
+#include "src/utils.cpp"
 
 constexpr int PORT = 8080;
 constexpr int MAX_EVENTS = 64;
 constexpr int BUF_SIZE = 4096;
 
-const std::string CLIENT_CLOSED = "Client closed connection.";
-const std::string CLIENT_CLOSED_UNEXP = "Client unexpectedly closed connection.";
+const char* CLIENT_CLOSED = "Upstream client closed connection.\n";
+const char* CLIENT_CLOSED_UNEXP = "Upstream client unexpectedly closed connection.\n";
+const char* OK = "HTTP/1.1 200 Connection Established\r\n\r\n";
 
 using Proxy::Connection;
 
@@ -128,6 +131,37 @@ int main() {
 
 				// drain write buffer if required
 				if (events[i].events & EPOLLOUT) {
+					// check for in-progress connection with server
+					if (conn->is_upstream && conn->connect_in_progress) {
+						int err = 0;
+						socklen_t len = sizeof(err);
+
+						if (getsockopt(conn->fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
+							// connect failed
+							conn->closed = true;
+							conn->peer->closed = true;
+						}
+
+						// connect succeeded
+						conn->connect_in_progress = false;
+
+						// send 200 Connection Established to client
+						conn->peer->write_buf.insert(
+						    conn->peer->write_buf.end(), OK, OK + strlen(OK));
+
+						// enable EPOLLOUT on client to flush 200
+						epoll_event cev{};
+						cev.events = EPOLLIN | EPOLLOUT;
+						cev.data.ptr = conn->peer;
+						epoll_ctl(epfd, EPOLL_CTL_MOD, conn->peer->fd, &cev);
+
+						// now enable EPOLLIN on upstream
+						epoll_event uev{};
+						uev.events = EPOLLIN;
+						uev.data.ptr = conn;
+						epoll_ctl(epfd, EPOLL_CTL_MOD, conn->fd, &uev);
+					}
+
 					while (!conn->write_buf.empty()) {
 						ssize_t w = write(fd, conn->write_buf.data(), conn->write_buf.size());
 
@@ -159,9 +193,65 @@ int main() {
 					ssize_t bytes = read(fd, buffer, BUF_SIZE);
 
 					if (bytes > 0) {
-						
+
 						if (!conn->peer) {
-							continue;
+							Proxy::HostPort hp = Proxy::Utils::parse_connect_target(buffer);
+							// create upstream socket
+							int upstream_fd = socket(AF_INET, SOCK_STREAM, 0);
+							if (upstream_fd < 0) {
+								perror("socket");
+								conn->closed = true;
+							}
+
+							set_nonblocking(upstream_fd);
+
+							// create upstream connection object
+							Connection* upstream = new Connection{};
+							upstream->fd = upstream_fd;
+							upstream->is_upstream = true;
+							upstream->connect_in_progress = true;
+
+							// pair client <-> upstream
+							conn->peer = upstream;
+							upstream->peer = conn;
+
+							// resolve domain of requested resource
+							// TODO: getaddrinfo is blocking: offload to background thread
+
+							addrinfo hints{}, *res;
+							hints.ai_family = AF_INET;
+							hints.ai_socktype = SOCK_STREAM;
+							int dns_rc = getaddrinfo(hp.host.c_str(), std::to_string(hp.port).c_str(), &hints, &res);
+
+							if (dns_rc != 0) {
+								fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(dns_rc));
+								conn->closed = true;
+							}
+
+							sockaddr_in addr = *(sockaddr_in*)res->ai_addr;
+							freeaddrinfo(res);
+
+							int connect_rc = connect(
+							    upstream_fd,
+							    (sockaddr*)&addr,
+							    sizeof(addr));
+
+							if (connect_rc == 0) {
+								// connected immediately
+								upstream->connect_in_progress = false;
+
+							} else if (errno == EINPROGRESS) {
+								// if connection in progress, arm EPOLLOUT
+								upstream->connect_in_progress = true;
+								epoll_event uev{};
+								uev.events = EPOLLOUT;
+								uev.data.ptr = upstream;
+								epoll_ctl(epfd, EPOLL_CTL_ADD, upstream_fd, &uev);
+
+							} else {
+								perror("connect");
+								conn->closed = true;
+							}
 						}
 
 						if (conn->peer) {
@@ -179,10 +269,13 @@ int main() {
 						// 0 bytes sent -> client closed connection
 						// close the connection, notify peer and move peer to waiting
 						conn->closed = true;
-						write(conn->peer->fd, CLIENT_CLOSED.c_str(), strlen(CLIENT_CLOSED.c_str()));
-
-						waiting_conn = conn->peer;
-						conn->peer->peer = nullptr;
+						if (conn->peer) {
+							// write(conn->peer->fd, CLIENT_CLOSED, strlen(CLIENT_CLOSED));
+							waiting_conn = conn->peer;
+							conn->peer->peer = nullptr;
+						} else if (waiting_conn == conn) {
+							waiting_conn = nullptr;
+						}
 
 						break;
 
@@ -195,9 +288,11 @@ int main() {
 
 						if (conn->peer) {
 							conn->peer->peer = nullptr;
+							// this is no longer required - debug only
+							// write(conn->peer->fd, CLIENT_CLOSED_UNEXP, strlen(CLIENT_CLOSED_UNEXP));
+						} else if (waiting_conn == conn) {
+							waiting_conn = nullptr;
 						}
-
-						write(conn->peer->fd, CLIENT_CLOSED_UNEXP.c_str(), strlen(CLIENT_CLOSED_UNEXP.c_str()));
 						break;
 					}
 				}
