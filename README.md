@@ -43,6 +43,9 @@ This will produce an executable named `proxy-server`.
 
    ```sh
    curl -x http://localhost:8080 https://example.com
+
+   # optionally add the -v flag to see verbose output
+   curl -x http://localhost:8080 -v https://example.com
    ```
 
    _This client will connect to the requested URL via the proxy server._
