@@ -9,27 +9,64 @@
 
 #include <cstring>
 #include <iostream>
+#include <vector>
 
 #include "include/conn.h"
-#include "src/utils.cpp"
+#include "src/utils.h"
 
 constexpr int PORT = 8080;
 constexpr int MAX_EVENTS = 64;
 constexpr int BUF_SIZE = 4096;
 
-const char* CLIENT_CLOSED = "Upstream client closed connection.\n";
-const char* CLIENT_CLOSED_UNEXP = "Upstream client unexpectedly closed connection.\n";
 const char* OK = "HTTP/1.1 200 Connection Established\r\n\r\n";
+const char* BAD_REQUEST = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const char* BAD_GATEWAY = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
 using Proxy::Connection;
-
-Connection* waiting_conn = nullptr;
 
 int set_nonblocking(int fd) {
 	int flags = fcntl(fd, F_GETFL, 0);
 	if (flags == -1)
 		return -1;
 	return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+// Send an error response to the client and mark it for closure.
+static void send_error_and_close(int epfd, Connection* conn, const char* response) {
+	conn->write_buf.insert(conn->write_buf.end(), response, response + strlen(response));
+	conn->closed = true;
+
+	epoll_event ev{};
+	ev.events = EPOLLOUT;
+	ev.data.ptr = conn;
+	epoll_ctl(epfd, EPOLL_CTL_MOD, conn->fd, &ev);
+}
+
+// Cleanly close a connection and its peer (if any).
+// Removes both from epoll, closes fds, and frees memory.
+static void cleanup_connection(int epfd, Connection* conn) {
+	if (!conn)
+		return;
+
+	Connection* peer = conn->peer;
+
+	// Unlink peers
+	if (peer) {
+		peer->peer = nullptr;
+	}
+
+	// Remove and close this connection
+	epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
+	close(conn->fd);
+	delete conn;
+
+	// Also close the peer
+	if (peer) {
+		peer->closed = true;
+		epoll_ctl(epfd, EPOLL_CTL_DEL, peer->fd, nullptr);
+		close(peer->fd);
+		delete peer;
+	}
 }
 
 int main() {
@@ -81,6 +118,8 @@ int main() {
 	while (true) {
 		int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
 		if (n < 0) {
+			if (errno == EINTR)
+				continue;
 			perror("epoll_wait");
 			break;
 		}
@@ -102,9 +141,8 @@ int main() {
 
 					set_nonblocking(client_fd);
 
-					Connection* conn = new Connection{client_fd, false};
-
-					// waiting_conn no longer required -> dynamic peer creation
+					Connection* conn = new Connection{};
+					conn->fd = client_fd;
 
 					epoll_event cev{};
 					cev.events = EPOLLIN;
@@ -112,215 +150,241 @@ int main() {
 
 					epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &cev);
 				}
+				continue;
 			}
-			// client socket event
-			else {
-				Connection* conn =
-				    static_cast<Connection*>(events[i].data.ptr);
-				int fd = conn->fd;
 
-				// drain write buffer if required
-				if (events[i].events & EPOLLOUT) {
-					// check for in-progress connection with server
-					if (conn->is_upstream && conn->connect_in_progress) {
-						int err = 0;
-						socklen_t len = sizeof(err);
+			// client/upstream socket event
+			Connection* conn =
+			    static_cast<Connection*>(events[i].data.ptr);
+			int fd = conn->fd;
 
-						if (getsockopt(conn->fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
-							// connect failed
-							conn->closed = true;
-							conn->peer->closed = true;
-						}
+			// drain write buffer if EPOLLOUT is set
+			if (events[i].events & EPOLLOUT) {
+				// check for in-progress connection with server
+				if (conn->is_upstream && conn->connect_in_progress) {
+					int err = 0;
+					socklen_t len = sizeof(err);
 
-						// connect succeeded
+					if (getsockopt(conn->fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
+						// connect failed — send 502 to client
 						conn->connect_in_progress = false;
-
-						// send 200 Connection Established to client ONLY for CONNECT tunnels
-						if (conn->peer->is_connect_method) {
-							conn->peer->write_buf.insert(
-							    conn->peer->write_buf.end(), OK, OK + strlen(OK));
-
-							// enable EPOLLOUT on client to flush 200
-							epoll_event cev{};
-							cev.events = EPOLLIN | EPOLLOUT;
-							cev.data.ptr = conn->peer;
-							epoll_ctl(epfd, EPOLL_CTL_MOD, conn->peer->fd, &cev);
-						} else {
-							// for standard HTTP, just ensure client is watching for input
-							epoll_event cev{};
-							cev.events = EPOLLIN;
-							cev.data.ptr = conn->peer;
-							epoll_ctl(epfd, EPOLL_CTL_MOD, conn->peer->fd, &cev);
+						if (conn->peer) {
+							send_error_and_close(epfd, conn->peer, BAD_GATEWAY);
+							conn->peer->peer = nullptr;
+							conn->peer = nullptr;
 						}
-
-						// now enable EPOLLIN on upstream
-						epoll_event uev{};
-						uev.events = EPOLLIN;
-						uev.data.ptr = conn;
-						epoll_ctl(epfd, EPOLL_CTL_MOD, conn->fd, &uev);
+						conn->closed = true;
+						epoll_ctl(epfd, EPOLL_CTL_DEL, conn->fd, nullptr);
+						close(conn->fd);
+						delete conn;
+						continue;
 					}
 
-					while (!conn->write_buf.empty()) {
-						ssize_t w = write(fd, conn->write_buf.data(), conn->write_buf.size());
+					// connect succeeded
+					conn->connect_in_progress = false;
 
-						if (w > 0) {
-							conn->write_buf.erase(conn->write_buf.begin(), conn->write_buf.begin() + w);
-						}
+					// send 200 Connection Established to client ONLY for CONNECT tunnels
+					if (conn->peer->is_connect_method) {
+						conn->peer->write_buf.insert(
+						    conn->peer->write_buf.end(), OK, OK + strlen(OK));
 
-						else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-							break;
-						}
-
-						else {
-							perror("write");
-							conn->closed = true;
-							break;
-						}
+						// enable EPOLLOUT on client to flush 200
+						epoll_event cev{};
+						cev.events = EPOLLIN | EPOLLOUT;
+						cev.data.ptr = conn->peer;
+						epoll_ctl(epfd, EPOLL_CTL_MOD, conn->peer->fd, &cev);
+					} else {
+						// for standard HTTP, just ensure client is watching for input
+						epoll_event cev{};
+						cev.events = EPOLLIN;
+						cev.data.ptr = conn->peer;
+						epoll_ctl(epfd, EPOLL_CTL_MOD, conn->peer->fd, &cev);
 					}
 
-					// if write buffer is drained, disarm EPOLLOUT
-					if (conn->write_buf.empty() && !conn->closed) {
-						epoll_event ev{};
-						ev.events = EPOLLIN;
-						ev.data.ptr = conn;
-						epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
-					}
+					// now enable EPOLLIN on upstream
+					epoll_event uev{};
+					uev.events = EPOLLIN;
+					uev.data.ptr = conn;
+					epoll_ctl(epfd, EPOLL_CTL_MOD, conn->fd, &uev);
 				}
 
-				while (true) {
-					ssize_t bytes = read(fd, buffer, BUF_SIZE);
+				while (!conn->write_buf.empty()) {
+					ssize_t w = write(fd, conn->write_buf.data(), conn->write_buf.size());
 
-					if (bytes > 0) {
-						bool just_paired = false;
-
-						if (!conn->peer) {
-							Proxy::HostPort hp = Proxy::Utils::parse_request_target(buffer);
-							conn->is_connect_method = hp.is_connect;
-
-							// create upstream socket
-							int upstream_fd = socket(AF_INET, SOCK_STREAM, 0);
-							if (upstream_fd < 0) {
-								perror("socket");
-								conn->closed = true;
-							}
-
-							set_nonblocking(upstream_fd);
-
-							// create upstream connection object
-							Connection* upstream = new Connection{};
-							upstream->fd = upstream_fd;
-							upstream->is_upstream = true;
-							upstream->connect_in_progress = true;
-							// upstream doesn't need is_connect_method, only the client side (conn) does
-
-							// pair client <-> upstream
-							conn->peer = upstream;
-							upstream->peer = conn;
-							just_paired = true;
-
-							// resolve domain of requested resource
-							// TODO: getaddrinfo is blocking: offload to background thread
-
-							addrinfo hints{}, *res;
-							hints.ai_family = AF_INET;
-							hints.ai_socktype = SOCK_STREAM;
-							int dns_rc = getaddrinfo(hp.host.c_str(), std::to_string(hp.port).c_str(), &hints, &res);
-
-							if (dns_rc != 0) {
-								fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(dns_rc));
-								conn->closed = true;
-							}
-
-							sockaddr_in addr = *(sockaddr_in*)res->ai_addr;
-							freeaddrinfo(res);
-
-							int connect_rc = connect(
-							    upstream_fd,
-							    (sockaddr*)&addr,
-							    sizeof(addr));
-
-							if (connect_rc == 0) {
-								// connected immediately
-								upstream->connect_in_progress = false;
-
-								if (conn->is_connect_method) {
-									conn->write_buf.insert(conn->write_buf.end(), OK, OK + strlen(OK));
-									epoll_event cev{};
-									cev.events = EPOLLIN | EPOLLOUT;
-									cev.data.ptr = conn;
-									epoll_ctl(epfd, EPOLL_CTL_MOD, conn->fd, &cev);
-								}
-
-								epoll_event uev{};
-								uev.events = EPOLLIN;
-								uev.data.ptr = upstream;
-								epoll_ctl(epfd, EPOLL_CTL_ADD, upstream_fd, &uev);
-
-							} else if (connect_rc < 0 && errno == EINPROGRESS) {
-								// if connection in progress, arm EPOLLOUT
-								upstream->connect_in_progress = true;
-								epoll_event uev{};
-								uev.events = EPOLLOUT;
-								uev.data.ptr = upstream;
-								epoll_ctl(epfd, EPOLL_CTL_ADD, upstream_fd, &uev);
-
-							} else {
-								perror("connect");
-								conn->closed = true;
-							}
-						}
-
-						if (conn->peer) {
-							// if we just paired and it's CONNECT, do NOT forward the buffer.
-							// if we just paired and it's NOT CONNECT (HTTP), we MUST forward.
-							// if we were already paired, we always forward.
-							if (!just_paired || !conn->is_connect_method) {
-								// write to peer's write buffer
-								conn->peer->write_buf.insert(conn->peer->write_buf.end(), buffer, buffer + bytes);
-
-								// create a new write event on the peer
-								epoll_event pev{};
-								pev.events = EPOLLIN | EPOLLOUT;
-								pev.data.ptr = conn->peer;
-								epoll_ctl(epfd, EPOLL_CTL_MOD, conn->peer->fd, &pev);
-							}
-						}
-					} else if (bytes == 0) {
-						// 0 bytes sent -> client closed connection
-						// close the connection, notify peer and move peer to waiting
-						conn->closed = true;
-						if (conn->peer) {
-							// write(conn->peer->fd, CLIENT_CLOSED, strlen(CLIENT_CLOSED));
-							waiting_conn = conn->peer;
-							conn->peer->peer = nullptr;
-						} else if (waiting_conn == conn) {
-							waiting_conn = nullptr;
-						}
-
+					if (w > 0) {
+						conn->write_buf.erase(conn->write_buf.begin(), conn->write_buf.begin() + w);
+					} else if (w == 0 || errno == EAGAIN || errno == EWOULDBLOCK) {
+						// write returned 0 or would block — try again later
 						break;
 					} else {
-						// in case of error, terminate clients
-						if (errno == EAGAIN || errno == EWOULDBLOCK)
-							break;
-						perror("read");
+						perror("write");
 						conn->closed = true;
-
-						if (conn->peer) {
-							conn->peer->peer = nullptr;
-							// this is no longer required - debug only
-							// write(conn->peer->fd, CLIENT_CLOSED_UNEXP, strlen(CLIENT_CLOSED_UNEXP));
-						} else if (waiting_conn == conn) {
-							waiting_conn = nullptr;
-						}
 						break;
 					}
 				}
 
-				if (conn->closed) {
+				// if write buffer is drained, disarm EPOLLOUT
+				if (conn->write_buf.empty() && !conn->closed) {
+					epoll_event wev{};
+					wev.events = EPOLLIN;
+					wev.data.ptr = conn;
+					epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &wev);
+				}
+
+				// if we marked it closed during error response drain, finish the cleanup
+				if (conn->closed && conn->write_buf.empty()) {
 					epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
 					close(fd);
 					delete conn;
+					continue;
 				}
+			}
+
+			// read loop
+			while (true) {
+				ssize_t bytes = read(fd, buffer, BUF_SIZE);
+
+				if (bytes > 0) {
+					bool just_paired = false;
+
+					if (!conn->peer) {
+						Proxy::HostPort hp = Proxy::Utils::parse_request_target(buffer);
+
+						// Handle parse errors
+						if (hp.error) {
+							fprintf(stderr, "parse error: %s\n", hp.error_msg.c_str());
+							send_error_and_close(epfd, conn, BAD_REQUEST);
+							break;
+						}
+
+						conn->is_connect_method = hp.is_connect;
+
+						// create upstream socket
+						int upstream_fd = socket(AF_INET, SOCK_STREAM, 0);
+						if (upstream_fd < 0) {
+							perror("socket");
+							send_error_and_close(epfd, conn, BAD_GATEWAY);
+							break;
+						}
+
+						set_nonblocking(upstream_fd);
+
+						// resolve domain
+						addrinfo hints{}, *res = nullptr;
+						hints.ai_family = AF_INET;
+						hints.ai_socktype = SOCK_STREAM;
+						int dns_rc = getaddrinfo(hp.host.c_str(), std::to_string(hp.port).c_str(), &hints, &res);
+
+						if (dns_rc != 0 || !res) {
+							fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(dns_rc));
+							close(upstream_fd);
+							if (res) freeaddrinfo(res);
+							send_error_and_close(epfd, conn, BAD_GATEWAY);
+							break;
+						}
+
+						sockaddr_in upstream_addr = *(sockaddr_in*)res->ai_addr;
+						freeaddrinfo(res);
+
+						// create upstream connection object
+						Connection* upstream = new Connection{};
+						upstream->fd = upstream_fd;
+						upstream->is_upstream = true;
+						upstream->connect_in_progress = true;
+
+						// pair client <-> upstream
+						conn->peer = upstream;
+						upstream->peer = conn;
+						just_paired = true;
+
+						int connect_rc = connect(
+						    upstream_fd,
+						    (sockaddr*)&upstream_addr,
+						    sizeof(upstream_addr));
+
+						if (connect_rc == 0) {
+							// connected immediately
+							upstream->connect_in_progress = false;
+
+							if (conn->is_connect_method) {
+								conn->write_buf.insert(conn->write_buf.end(), OK, OK + strlen(OK));
+								epoll_event cev{};
+								cev.events = EPOLLIN | EPOLLOUT;
+								cev.data.ptr = conn;
+								epoll_ctl(epfd, EPOLL_CTL_MOD, conn->fd, &cev);
+							}
+
+							epoll_event uev{};
+							uev.events = EPOLLIN;
+							uev.data.ptr = upstream;
+							epoll_ctl(epfd, EPOLL_CTL_ADD, upstream_fd, &uev);
+
+						} else if (connect_rc < 0 && errno == EINPROGRESS) {
+							// connection in progress, arm EPOLLOUT
+							upstream->connect_in_progress = true;
+							epoll_event uev{};
+							uev.events = EPOLLOUT;
+							uev.data.ptr = upstream;
+							epoll_ctl(epfd, EPOLL_CTL_ADD, upstream_fd, &uev);
+
+						} else {
+							perror("connect");
+							// Unlink and clean up the upstream
+							conn->peer = nullptr;
+							upstream->peer = nullptr;
+							close(upstream_fd);
+							delete upstream;
+							send_error_and_close(epfd, conn, BAD_GATEWAY);
+							break;
+						}
+					}
+
+					if (conn->peer) {
+						// If we just paired and it's CONNECT, do NOT forward the buffer.
+						// If we just paired and it's NOT CONNECT (HTTP), we MUST rewrite & forward.
+						// If we were already paired, we always forward.
+						if (!just_paired || !conn->is_connect_method) {
+							if (just_paired && !conn->is_connect_method) {
+								// Rewrite absolute-URI to relative for origin server
+								std::vector<char> rewritten =
+								    Proxy::Utils::rewrite_request(buffer, bytes);
+								conn->peer->write_buf.insert(
+								    conn->peer->write_buf.end(),
+								    rewritten.begin(), rewritten.end());
+							} else {
+								conn->peer->write_buf.insert(
+								    conn->peer->write_buf.end(), buffer, buffer + bytes);
+							}
+
+							// arm EPOLLOUT on the peer
+							epoll_event pev{};
+							pev.events = EPOLLIN | EPOLLOUT;
+							pev.data.ptr = conn->peer;
+							epoll_ctl(epfd, EPOLL_CTL_MOD, conn->peer->fd, &pev);
+						}
+					}
+				} else if (bytes == 0) {
+					// Peer closed — clean up both sides
+					cleanup_connection(epfd, conn);
+					conn = nullptr;
+					break;
+				} else {
+					if (errno == EAGAIN || errno == EWOULDBLOCK)
+						break;
+					perror("read");
+					cleanup_connection(epfd, conn);
+					conn = nullptr;
+					break;
+				}
+			}
+
+			// If conn was cleaned up inside the read loop, skip the post-loop check
+			if (!conn)
+				continue;
+
+			// Handle deferred close (e.g. after send_error_and_close scheduled a write)
+			if (conn->closed && conn->write_buf.empty()) {
+				cleanup_connection(epfd, conn);
 			}
 		}
 	}

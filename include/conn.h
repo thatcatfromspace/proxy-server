@@ -6,8 +6,8 @@
 
 namespace Proxy {
 struct Connection {
-	int fd;
-	bool closed;
+	int fd = -1;
+	bool closed = false;
 	std::vector<char> write_buf = {};
 	Connection* peer = nullptr;
 
@@ -18,8 +18,10 @@ struct Connection {
 
 struct HostPort {
 	std::string host;
-	uint16_t port;
+	uint16_t port = 80;
 	bool is_connect = false;
+	bool error = false;
+	std::string error_msg;
 };
 
 } // namespace Proxy
